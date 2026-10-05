@@ -1,0 +1,46 @@
+name: Norway sub-units (monthly)
+
+on:
+  schedule:
+    - cron: "11 3 3 * *"
+  workflow_dispatch:
+    inputs:
+      record_limit:
+        description: "Stop after this many records (0 = all). Use 2000 for a test run."
+        default: "0"
+      skip:
+        description: "Records already loaded (set automatically when a long run continues)"
+        default: "0"
+      source_id:
+        description: "File the chain started on (set automatically when a long run continues)"
+        default: ""
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: bulk-jobs
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run job
+        working-directory: jobs
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          RECORD_LIMIT: ${{ github.event.inputs.record_limit || '0' }}
+          SKIP: ${{ github.event.inputs.skip || '0' }}
+          SOURCE_ID: ${{ github.event.inputs.source_id || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
+
+        run: python norway_subunits.py
