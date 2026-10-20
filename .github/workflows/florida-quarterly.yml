@@ -28,12 +28,28 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      - name: Install unzip (Deflate64 members)
+        run: command -v unzip >/dev/null || (sudo apt-get update && sudo apt-get install -y unzip)
+      - name: Look up newest file on the server
+        id: remote
+        working-directory: jobs
+        env:
+          FL_SFTP_USER: ${{ secrets.FL_SFTP_USER }}
+          FL_SFTP_PASSWORD: ${{ secrets.FL_SFTP_PASSWORD }}
+        run: python florida_quarterly.py remote-key
+      # Keyed on filename+mtime+size, so a parse failure does not force another 30-minute download.
+      - name: Restore downloaded zip
+        id: zip
+        uses: actions/cache/restore@v6
+        with:
+          path: /tmp/cordata.zip
+          key: cordata-${{ steps.remote.outputs.key }}
       - name: Run job
         working-directory: jobs
         env:
@@ -45,3 +61,10 @@ jobs:
           FL_SFTP_USER: ${{ secrets.FL_SFTP_USER }}
           FL_SFTP_PASSWORD: ${{ secrets.FL_SFTP_PASSWORD }}
         run: python florida_quarterly.py
+      # The job writes /tmp/cordata.zip only once the download is complete, so a partial file is never cached.
+      - name: Save downloaded zip
+        if: always() && steps.zip.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: /tmp/cordata.zip
+          key: cordata-${{ steps.remote.outputs.key }}
