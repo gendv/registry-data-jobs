@@ -28,3 +28,12 @@ a job stops cleanly, records where it paused, and starts a new run of itself wit
 number of records already loaded and `source_id` set to the file it was reading. If the source file
 has changed by then, the new run loads the new file from the start. Re-loading a record is harmless
 (upsert by key).
+
+If a database call or the record iterator hangs, a watchdog thread starts the continuation itself
+`WATCHDOG_GRACE_MIN` (15) minutes after `MAX_MINUTES` and exits non-zero so the stall is visible.
+Each `bulk_ingest` call also has a 120 s statement timeout (`STATEMENT_TIMEOUT_S`) and TCP keepalives,
+so a stuck call raises and goes through the existing split/retry logic.
+
+The Florida workflow caches the downloaded zip (key: filename, mtime, size), so a parse failure
+does not force another download. Members that Python's zipfile cannot decompress (Deflate64) are
+streamed through `unzip -p`.

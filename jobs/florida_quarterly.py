@@ -4,9 +4,14 @@ Downloads the newest cordata*.zip from the state's public SFTP server and
 parses the fixed-width 1440-character records (same layout as the daily files
 handled in n8n).
 """
+import contextlib
 import io
 import os
+import re
 import stat
+import subprocess
+import sys
+import time
 import zipfile
 
 import paramiko
@@ -16,6 +21,8 @@ from common import clean, guarded, log, run_job, valid_day
 HOST = "sftp.floridados.gov"
 FOLDER = "/Public/doc/Quarterly/Cor"
 LOCAL = "/tmp/cordata.zip"
+# Methods Python's zipfile can decompress; anything else (e.g. Deflate64, type 9) goes through `unzip -p`.
+NATIVE_METHODS = (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED, zipfile.ZIP_BZIP2, zipfile.ZIP_LZMA)
 
 
 def _connect():
@@ -26,19 +33,46 @@ def _connect():
     return transport, paramiko.SFTPClient.from_transport(transport)
 
 
-def download():
-    """Resumable download: the state server drops long transfers, so read in blocks
-    and reconnect from the last offset when the connection goes."""
-    import time
-    transport, sftp = _connect()
+def _newest(sftp):
     files = [f for f in sftp.listdir_attr(FOLDER)
              if not stat.S_ISDIR(f.st_mode) and f.filename.lower().startswith("cordata") and f.filename.lower().endswith(".zip")]
-    newest = max(files, key=lambda f: f.st_mtime)
+    return max(files, key=lambda f: f.st_mtime)
+
+
+def _version(f):
+    return f"{f.filename}:{int(f.st_mtime)}:{f.st_size}"
+
+
+def remote_key():
+    """Print the newest file's identity (name, mtime, size) as a step output, so the workflow
+    can restore a cached copy of the zip before the job runs."""
+    transport, sftp = _connect()
+    newest = _newest(sftp)
+    transport.close()
+    key = re.sub(r"[^A-Za-z0-9._-]", "-", _version(newest))
+    log(f"newest file: {_version(newest)}")
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"key={key}\n")
+
+
+def download():
+    """Resumable download: the state server drops long transfers, so read in blocks
+    and reconnect from the last offset when the connection goes.
+    Skipped when a complete copy of the same file is already in LOCAL (restored from the
+    workflow cache); the copy is written as .part and renamed only when complete."""
+    transport, sftp = _connect()
+    newest = _newest(sftp)
     size, mtime = newest.st_size, newest.st_mtime
     path = f"{FOLDER}/{newest.filename}"
+    if os.path.exists(LOCAL) and os.path.getsize(LOCAL) == size:
+        log(f"using cached {newest.filename} ({size / 1e9:.2f} GB)")
+        sftp.close()
+        transport.close()
+        return newest.filename, _version(newest)
     log(f"downloading {newest.filename} ({size / 1e9:.2f} GB)")
     done, failures, last_log = 0, 0, 0
-    with open(LOCAL, "wb") as out:
+    with open(LOCAL + ".part", "wb") as out:
         while done < size:
             try:
                 with sftp.open(path, "rb") as remote:
@@ -67,9 +101,10 @@ def download():
                 st = sftp.stat(path)
                 if st.st_size != size or st.st_mtime != mtime:
                     raise RuntimeError("the file changed on the server during download")
+    os.replace(LOCAL + ".part", LOCAL)
     sftp.close()
     transport.close()
-    return newest.filename, f"{newest.filename}:{int(mtime)}:{size}"
+    return newest.filename, _version(newest)
 
 
 def s(line, a, n):
@@ -118,13 +153,43 @@ def parse(line):
     })
 
 
+@contextlib.contextmanager
+def open_member(z, name):
+    """Binary stream of one zip member. zipfile where it can, `unzip -p` (Info-ZIP, handles
+    Deflate64) for any other compression method."""
+    info = z.getinfo(name)
+    if info.compress_type in NATIVE_METHODS:
+        with z.open(info) as raw:
+            yield raw
+        return
+    log(f"{name}: compression method {info.compress_type} is not supported by zipfile, streaming through unzip")
+    # unzip treats the member name as a wildcard pattern
+    pattern = re.sub(r"([\\\[\]*?])", r"\\\1", name)
+    proc = subprocess.Popen(["unzip", "-p", LOCAL, pattern], stdout=subprocess.PIPE)
+    try:
+        yield proc.stdout
+    except BaseException:
+        proc.kill()
+        raise
+    else:
+        proc.stdout.read()  # drain if the caller stopped early, so unzip can exit
+    finally:
+        proc.stdout.close()
+        rc = proc.wait()
+    if rc not in (0, 1):  # 1 = warnings only
+        raise RuntimeError(f"unzip -p {name} exited with status {rc}")
+
+
 def records():
     with zipfile.ZipFile(LOCAL) as z:
+        for info in z.infolist():
+            log(f"member {info.filename}: compress_type={info.compress_type} "
+                f"compressed={info.compress_size:,} size={info.file_size:,}")
         for name in sorted(z.namelist()):
             if not name.lower().endswith(".txt"):
                 continue
             log(f"reading {name}")
-            with z.open(name) as raw:
+            with open_member(z, name) as raw:
                 for line in io.TextIOWrapper(raw, encoding="latin-1", newline=None):
                     line = line.rstrip("\r\n")
                     if len(line) < 1000:
@@ -141,4 +206,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["remote-key"]:
+        remote_key()
+        sys.exit(0)
     guarded("Florida companies (auto)", main)

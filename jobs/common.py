@@ -6,6 +6,7 @@ prospecting.bulk_ingest, which only accepts the bulk-job sources.
 import json
 import os
 import sys
+import threading
 import time
 from datetime import date
 
@@ -22,8 +23,12 @@ MAX_MINUTES = int(os.environ.get("MAX_MINUTES", "290"))
 T0 = time.time()
 # Identity of the source file this chain started on (set automatically on continuations).
 SOURCE_ID = os.environ.get("SOURCE_ID", "")
+# Server-side cap per bulk_ingest call. A call that exceeds it raises QueryCanceled, which send() answers by splitting the batch.
+STATEMENT_TIMEOUT_S = int(os.environ.get("STATEMENT_TIMEOUT_S", "120"))
+# If the main loop has not handed over this long after MAX_MINUTES (stuck in a call or the iterator), the watchdog does it.
+WATCHDOG_GRACE_MIN = int(os.environ.get("WATCHDOG_GRACE_MIN", "15"))
 # Shared with guarded() so an error is written to the run that failed, with the resume point.
-STATE = {"run": None, "sent": 0, "skip": SKIP}
+STATE = {"run": None, "sent": 0, "skip": SKIP, "source_id": "", "handed_over": False}
 
 
 def valid_day(v):
@@ -45,8 +50,67 @@ def _connect():
     url = os.environ.get("DATABASE_URL")
     if not url:
         sys.exit("DATABASE_URL secret is missing")
-    # prepare_threshold=None: the Supabase pooler in transaction mode cannot keep prepared statements
-    return psycopg.connect(url, autocommit=True, prepare_threshold=None, connect_timeout=30)
+    # prepare_threshold=None: the Supabase pooler in transaction mode cannot keep prepared statements.
+    # The TCP settings make a silently dead connection raise OperationalError (and so reach the retry
+    # logic) instead of blocking forever; the server-side statement timeout cannot help when the
+    # network path itself has stalled.
+    return psycopg.connect(url, autocommit=True, prepare_threshold=None, connect_timeout=30,
+                           keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3,
+                           tcp_user_timeout=(STATEMENT_TIMEOUT_S + 60) * 1000)
+
+
+def _ingest_call(conn, run, payload, note):
+    """One bulk_ingest call with a per-call statement timeout. The timeout is set with
+    set_config(..., is_local) inside a transaction rather than as a startup option, because the
+    Supabase pooler in transaction mode does not pass startup options through."""
+    with conn.transaction():
+        conn.execute("select set_config('statement_timeout', %s, true)", (f"{STATEMENT_TIMEOUT_S}s",))
+        conn.execute("select prospecting.bulk_ingest(%s, %s::jsonb, %s)", (run, payload, note))
+
+
+def _dispatch_continuation(skip, source_id):
+    """Start a new run of this workflow that resumes at record `skip`."""
+    import requests
+    repo = os.environ["GITHUB_REPOSITORY"]
+    wf = os.environ["GITHUB_WORKFLOW_REF"].split("@")[0].split("/")[-1]
+    ref = os.environ.get("GITHUB_REF_NAME", "main")
+    r = requests.post(
+        f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
+        headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Accept": "application/vnd.github+json"},
+        json={"ref": ref, "inputs": {"skip": str(skip), "record_limit": "0", "source_id": source_id or ""}},
+        timeout=30,
+    )
+    r.raise_for_status()
+    log(f"continuation started from record {skip:,}")
+
+
+def _watchdog():
+    """Backstop for a main thread that is stuck (a database call or the record iterator that never
+    returns). The normal MAX_MINUTES check only runs while the loop is moving; this one runs on a
+    timer. WATCHDOG_GRACE_MIN after the deadline it records the resume point, starts the
+    continuation from what is known to be loaded, and exits non-zero so the stall shows up as a failed run."""
+    deadline = T0 + (MAX_MINUTES + WATCHDOG_GRACE_MIN) * 60
+    while time.time() < deadline:
+        if STATE["handed_over"]:
+            return
+        time.sleep(15)
+    if STATE["handed_over"]:
+        return
+    resume = STATE["skip"] + STATE["sent"]
+    log(f"watchdog: no hand-over {WATCHDOG_GRACE_MIN} min after MAX_MINUTES={MAX_MINUTES}; main thread is stuck")
+    try:
+        if STATE["run"]:
+            conn = _connect()
+            _ingest_call(conn, STATE["run"], "[]", f"stalled: continue from skip={resume}")
+            conn.close()
+    except Exception as e:
+        log(f"watchdog: could not record the stall: {e}")
+    try:
+        if not LIMIT:
+            _dispatch_continuation(resume, STATE["source_id"])
+    except Exception as e:
+        log(f"watchdog: could not start the continuation (resume with skip={resume}): {e}")
+    os._exit(3)
 
 
 def ingest(source, records, note=None, skip=None):
@@ -57,6 +121,7 @@ def ingest(source, records, note=None, skip=None):
     run = conn.execute("select prospecting.bulk_run_start(%s)", (source,)).fetchone()[0]
     STATE.update(run=run, sent=0, skip=skip)
     log(f"run {run} started for {source}")
+    threading.Thread(target=_watchdog, daemon=True).start()
     batch, sent, t0 = [], 0, time.time()
 
     def send(rows):
@@ -67,7 +132,7 @@ def ingest(source, records, note=None, skip=None):
             try:
                 if conn is None or conn.closed:
                     conn = _connect()
-                conn.execute("select prospecting.bulk_ingest(%s, %s::jsonb, %s)", (run, payload, note))
+                _ingest_call(conn, run, payload, note)
                 return
             except psycopg.errors.QueryCanceled:
                 if len(rows) > 1:
@@ -105,6 +170,9 @@ def ingest(source, records, note=None, skip=None):
         if skipped < skip:
             skipped += 1
             continue
+        if time.time() - T0 > MAX_MINUTES * 60:  # also checked per record, not only after a flush
+            finished = False
+            break
         if paced_from is None:
             paced_from = time.time()
         if key is None or str(key).strip() == "":
@@ -123,9 +191,9 @@ def ingest(source, records, note=None, skip=None):
     flush()
     log(f"{'done' if finished else 'paused'}: {sent:,} records for {source} in {time.time() - t0:.0f}s (skipped {skipped:,})")
     if not finished:
-        conn.execute("select prospecting.bulk_ingest(%s, '[]'::jsonb, %s)",
-                     (run, f"paused: continue from skip={skip + sent}"))
+        _ingest_call(conn, run, "[]", f"paused: continue from skip={skip + sent}")
     conn.close()
+    STATE["handed_over"] = True
     return sent, finished
 
 
@@ -138,21 +206,11 @@ def run_job(source, records_fn, source_id=""):
     if SKIP and SOURCE_ID and source_id and SOURCE_ID != source_id:
         log(f"source changed since this chain started ({SOURCE_ID} -> {source_id}); loading the new file from the start")
         skip = 0
+    STATE["source_id"] = source_id or ""
     sent, finished = ingest(source, records_fn(), skip=skip)
     if finished or LIMIT:
         return
-    import requests
-    repo = os.environ["GITHUB_REPOSITORY"]
-    wf = os.environ["GITHUB_WORKFLOW_REF"].split("@")[0].split("/")[-1]
-    ref = os.environ.get("GITHUB_REF_NAME", "main")
-    r = requests.post(
-        f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
-        headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Accept": "application/vnd.github+json"},
-        json={"ref": ref, "inputs": {"skip": str(skip + sent), "record_limit": "0", "source_id": source_id or ""}},
-        timeout=30,
-    )
-    r.raise_for_status()
-    log(f"continuation started from record {skip + sent:,}")
+    _dispatch_continuation(skip + sent, source_id)
 
 
 def clean(d):
