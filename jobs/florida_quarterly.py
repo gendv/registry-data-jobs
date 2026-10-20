@@ -172,7 +172,9 @@ def open_member(z, name):
         proc.kill()
         raise
     else:
-        proc.stdout.read()  # drain if the caller stopped early, so unzip can exit
+        # The text wrapper in records() closes the pipe when its loop ends, so only drain if it is still open.
+        if not proc.stdout.closed:
+            proc.stdout.read()
     finally:
         proc.stdout.close()
         rc = proc.wait()
@@ -190,13 +192,17 @@ def records():
                 continue
             log(f"reading {name}")
             with open_member(z, name) as raw:
-                for line in io.TextIOWrapper(raw, encoding="latin-1", newline=None):
-                    line = line.rstrip("\r\n")
-                    if len(line) < 1000:
-                        continue
-                    item = parse(line)
-                    if item.get("doc_number"):
-                        yield item["doc_number"], item.get("file_date"), item
+                text = io.TextIOWrapper(raw, encoding="latin-1", newline=None)
+                try:
+                    for line in text:
+                        line = line.rstrip("\r\n")
+                        if len(line) < 1000:
+                            continue
+                        item = parse(line)
+                        if item.get("doc_number"):
+                            yield item["doc_number"], item.get("file_date"), item
+                finally:
+                    text.detach()  # open_member owns the stream; the wrapper must not close it when collected
 
 
 def main():
