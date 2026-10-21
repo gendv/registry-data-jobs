@@ -55,6 +55,8 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           RECORD_LIMIT: ${{ github.event.inputs.record_limit || '0' }}
+          # 2026-10-21: slow the backfill so it does not take most of the database read capacity (default 400000).
+          MAX_PER_HOUR: "180000"
           SKIP: ${{ github.event.inputs.skip || '0' }}
           SOURCE_ID: ${{ github.event.inputs.source_id || '' }}
           GITHUB_TOKEN: ${{ github.token }}

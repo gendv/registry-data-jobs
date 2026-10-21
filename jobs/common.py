@@ -36,10 +36,13 @@ def valid_day(v):
     if not v or len(v) != 10:
         return None
     try:
-        date.fromisoformat(v)
-        return v
+        day = date.fromisoformat(v)
     except ValueError:
         return None
+    # Source files contain typos such as 2124-09-06; a date more than a year ahead is treated as missing.
+    if (day - date.today()).days > 366:
+        return None
+    return v
 
 
 def log(msg):
