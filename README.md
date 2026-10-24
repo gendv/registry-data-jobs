@@ -20,6 +20,16 @@ Test run: Actions tab, pick a workflow, Run workflow, set record_limit to 2000.
 
 Attribution: Contains Australian, UK and Norwegian public sector data under their open licences (CC BY 3.0 AU, OGL, NLOD).
 
+## Insert-only loads (ABN)
+
+The ABN job runs in insert-only mode (`run_job(..., insert_only=True)`): it calls
+`prospecting.bulk_ingest_new_only`, which adds records whose key is new and leaves existing rows
+untouched (`on conflict do nothing`). The register has about 4.7M rows and only a few thousand are
+new each month; the old upsert rewrote every row each month. Side effect: changes to an existing
+ABN (name, status, GST) are not picked up, and `last_seen_at` stays at the first load.
+Other jobs still use `bulk_ingest` (upsert). The functions are in `sql/2026-10-24_abn_insert_only.sql`
+and must be applied before this change is merged.
+
 ## Pacing and long runs
 
 Jobs load at most 400,000 records per hour (`MAX_PER_HOUR`) so database disk auto-scaling can keep up.
