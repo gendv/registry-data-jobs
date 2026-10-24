@@ -54,6 +54,22 @@ class IngestModeTest(unittest.TestCase):
         common.run_job("y", lambda: iter(()))
         self.assertEqual(seen, [True, False])
 
+    def test_error_record_always_uses_bulk_ingest(self):
+        common.STATE["insert_only"] = True
+        common.STATE["run"] = "run-1"
+        self.addCleanup(common.STATE.__setitem__, "run", None)
+        conn = FakeConn()
+        orig = common._connect
+        common._connect = lambda: conn
+        conn.close = lambda: None
+        self.addCleanup(setattr, common, "_connect", orig)
+        def boom():
+            raise ValueError("x")
+        with self.assertRaises(ValueError):
+            common.guarded("src", boom)
+        self.assertIn("prospecting.bulk_ingest(", conn.calls[-1][0])
+        self.assertNotIn("new_only", conn.calls[-1][0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -260,7 +260,9 @@ def guarded(source, fn):
         try:
             conn = _connect()
             run = STATE["run"] or conn.execute("select prospecting.bulk_run_start(%s)", (source,)).fetchone()[0]
-            conn.execute(_ingest_sql(), (run, "[]", msg))
+            # Always the original function: it exists even if the insert-only functions were never applied,
+            # and with an empty list both only update the run's note.
+            conn.execute("select prospecting.bulk_ingest(%s, '[]'::jsonb, %s)", (run, msg))
             conn.close()
         except Exception as e2:
             log(f"could not record error: {e2}")
