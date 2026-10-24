@@ -2,6 +2,10 @@
 
 Keeps active ABNs that are not individuals (sole traders are never emailed).
 Each <ABR> element is converted to a dict mechanically.
+
+Insert-only: the register has ~4.7M rows and only a few thousand are new each month, so rows
+that already exist are left untouched (re-writing all of them every month produced ~4 GB of dead
+rows). The cost is that changes to an existing ABN (name, status, GST) are not picked up.
 """
 import os
 import zipfile
@@ -89,7 +93,7 @@ def main():
         download(res["url"], p)
         paths.append(p)
         ids.append((res.get("last_modified") or res.get("metadata_modified") or res["url"])[:19])
-    run_job("Australia businesses ABN (auto)", lambda: records(paths), source_id="|".join(ids))
+    run_job("Australia businesses ABN (auto)", lambda: records(paths), source_id="|".join(ids), insert_only=True)
 
 
 if __name__ == "__main__":

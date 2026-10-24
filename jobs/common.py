@@ -28,7 +28,7 @@ STATEMENT_TIMEOUT_S = int(os.environ.get("STATEMENT_TIMEOUT_S", "120"))
 # If the main loop has not handed over this long after MAX_MINUTES (stuck in a call or the iterator), the watchdog does it.
 WATCHDOG_GRACE_MIN = int(os.environ.get("WATCHDOG_GRACE_MIN", "15"))
 # Shared with guarded() so an error is written to the run that failed, with the resume point.
-STATE = {"run": None, "sent": 0, "skip": SKIP, "source_id": "", "handed_over": False}
+STATE = {"run": None, "sent": 0, "skip": SKIP, "source_id": "", "handed_over": False, "insert_only": False}
 
 
 def valid_day(v):
@@ -62,13 +62,20 @@ def _connect():
                            tcp_user_timeout=(STATEMENT_TIMEOUT_S + 60) * 1000)
 
 
+def _ingest_sql():
+    """The database call for this run. Insert-only mode never touches rows that already exist
+    (prospecting.bulk_ingest_new_only: on conflict do nothing); the default updates them (bulk_ingest)."""
+    fn = "bulk_ingest_new_only" if STATE["insert_only"] else "bulk_ingest"
+    return f"select prospecting.{fn}(%s, %s::jsonb, %s)"
+
+
 def _ingest_call(conn, run, payload, note):
     """One bulk_ingest call with a per-call statement timeout. The timeout is set with
     set_config(..., is_local) inside a transaction rather than as a startup option, because the
     Supabase pooler in transaction mode does not pass startup options through."""
     with conn.transaction():
         conn.execute("select set_config('statement_timeout', %s, true)", (f"{STATEMENT_TIMEOUT_S}s",))
-        conn.execute("select prospecting.bulk_ingest(%s, %s::jsonb, %s)", (run, payload, note))
+        conn.execute(_ingest_sql(), (run, payload, note))
 
 
 def _dispatch_continuation(skip, source_id):
@@ -116,14 +123,17 @@ def _watchdog():
     os._exit(3)
 
 
-def ingest(source, records, note=None, skip=None):
+def ingest(source, records, note=None, skip=None, insert_only=None):
     """Load records. Returns (sent, finished). finished=False means time ran out;
-    the caller should start a continuation with skip = skip + sent."""
+    the caller should start a continuation with skip = skip + sent.
+    insert_only=True only adds records whose key is new and leaves existing rows untouched."""
     skip = SKIP if skip is None else skip
+    if insert_only is not None:
+        STATE["insert_only"] = insert_only
     conn = _connect()
     run = conn.execute("select prospecting.bulk_run_start(%s)", (source,)).fetchone()[0]
     STATE.update(run=run, sent=0, skip=skip)
-    log(f"run {run} started for {source}")
+    log(f"run {run} started for {source} ({'insert-only' if STATE['insert_only'] else 'upsert'})")
     threading.Thread(target=_watchdog, daemon=True).start()
     batch, sent, t0 = [], 0, time.time()
 
@@ -200,7 +210,7 @@ def ingest(source, records, note=None, skip=None):
     return sent, finished
 
 
-def run_job(source, records_fn, source_id=""):
+def run_job(source, records_fn, source_id="", insert_only=False):
     """Ingest, then start a continuation run if time ran out.
     records_fn() returns the record iterator. source_id identifies the downloaded file;
     if a continuation finds a different file than the chain started on, it loads the
@@ -210,6 +220,7 @@ def run_job(source, records_fn, source_id=""):
         log(f"source changed since this chain started ({SOURCE_ID} -> {source_id}); loading the new file from the start")
         skip = 0
     STATE["source_id"] = source_id or ""
+    STATE["insert_only"] = insert_only
     sent, finished = ingest(source, records_fn(), skip=skip)
     if finished or LIMIT:
         return
@@ -249,6 +260,8 @@ def guarded(source, fn):
         try:
             conn = _connect()
             run = STATE["run"] or conn.execute("select prospecting.bulk_run_start(%s)", (source,)).fetchone()[0]
+            # Always the original function: it exists even if the insert-only functions were never applied,
+            # and with an empty list both only update the run's note.
             conn.execute("select prospecting.bulk_ingest(%s, '[]'::jsonb, %s)", (run, msg))
             conn.close()
         except Exception as e2:
