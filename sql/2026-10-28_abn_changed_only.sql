@@ -51,7 +51,7 @@ begin
   if v_src is null then raise exception 'unknown run' using errcode = 'P0002'; end if;
   if jsonb_typeof(p_items) is distinct from 'array' then raise exception 'items must be a list' using errcode = '22023'; end if;
   -- Equal-date updates still allowed in this chain (hard maximum 200000, whatever the caller passes).
-  v_budget := greatest(0, least(coalesce(p_max_same, 50000), 200000) - coalesce(p_same_before, 0));
+  v_budget := greatest(0, least(coalesce(p_max_same, 50000), 200000) - greatest(coalesce(p_same_before, 0), 0));
   select coalesce(jsonb_agg(e), '[]'::jsonb) into v_items from jsonb_array_elements(p_items) e where jsonb_typeof(e) = 'object';
 
   -- Step 1: new keys, ACT only, one sighting for posted_at. Existing keys are not touched (do nothing).
@@ -176,6 +176,12 @@ begin
   limit 1;
   return v_d;
 end $function$;
+
+-- Owner: postgres, stated explicitly (the security definer functions run with the owner's rights).
+alter function prospecting.abn_valid_rlud(text, date) owner to postgres;
+alter function prospecting.feed_ingest_changed(uuid, jsonb, text, bigint, integer) owner to postgres;
+alter function prospecting.bulk_ingest_changed(uuid, jsonb, text, bigint, integer) owner to postgres;
+alter function prospecting.bulk_last_success(text) owner to postgres;
 
 -- ACL: revoke before grant. Supabase default privileges give service_role execute on new functions,
 -- so it is revoked explicitly on the two job functions (feed_writer is the only caller).

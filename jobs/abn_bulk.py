@@ -239,8 +239,9 @@ def resolve_cutoff(source):
 def main():
     source = "Australia businesses ABN (auto)"
     paths, ids = [], []
+    workdir = tempfile.mkdtemp(prefix="abn_")
     for i, res in enumerate(zip_resources()):
-        p = f"/tmp/abn_{i}.zip"
+        p = os.path.join(workdir, f"abn_{i}.zip")
         download(res["url"], p)
         paths.append(p)
         ids.append((res.get("last_modified") or res.get("metadata_modified") or res["url"])[:19])
@@ -257,6 +258,11 @@ def main():
 
     skip = common.effective_skip(source_id)
     max_nonact = env_int("MAX_NONACT", 500_000)
+    changed_same = env_int("CHANGED_SAME", 0)
+    for name, v in (("max_nonact", max_nonact), ("changed_same", changed_same), ("skip", skip),
+                    ("nonact_count", env_int("NONACT_COUNT", 0))):
+        if v < 0:
+            raise GuardError(f"job error: negative {name} is not allowed")
     if skip == 0 and not common.SKIP:
         cutoff = resolve_cutoff(source)
         today = date.today()
@@ -282,7 +288,7 @@ def main():
             raise GuardError("job error: continuation without nonact_count")
     common.STATE["chain"] = {"cutoff": cutoff, "max_nonact": max_nonact, "nonact_count": expected,
                              "chain_date": today.isoformat()}
-    common.STATE["changed_same"] = env_int("CHANGED_SAME", 0)
+    common.STATE["changed_same"] = changed_same
 
     stream = Stats()
     file_tag = "_".join(source_id.split()) or "unknown"

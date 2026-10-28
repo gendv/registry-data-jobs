@@ -90,9 +90,15 @@ def _ingest_sql():
 
 
 def _resume_hint():
-    """' cutoff=YYYY-MM-DD' for jobs that carry a cutoff, so every resume note says how to continue."""
-    c = STATE["chain"].get("cutoff")
-    return f" cutoff={c}" if c else ""
+    """Every chain value a manual continuation needs, e.g. ' cutoff=2026-09-14 chain_date=2026-10-28
+    nonact_count=120 max_nonact=500000 changed_same=40'. Empty for jobs without a chain."""
+    chain = STATE["chain"]
+    if not chain:
+        return ""
+    parts = [f"{k}={chain[k]}" for k in ("cutoff", "chain_date", "nonact_count", "max_nonact")
+             if chain.get(k) not in (None, "")]
+    parts.append(f"changed_same={STATE['changed_same']}")
+    return " " + " ".join(parts)
 
 
 def _ingest_call(conn, run, payload, note):
@@ -359,6 +365,8 @@ def guarded(source, fn):
         if STATE["run"]:
             msg += f" (resume with skip={STATE['skip'] + STATE['sent']}{_resume_hint()})"
         log(msg)
+        if os.environ.get("COUNT_ONLY", "").strip() in ("1", "true"):
+            raise  # count-only never opens a database connection, not even to record an error
         try:
             conn = _connect()
             run = STATE["run"] or conn.execute("select prospecting.bulk_run_start(%s)", (source,)).fetchone()[0]

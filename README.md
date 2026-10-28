@@ -53,6 +53,11 @@ rollback path) never saw changes. Now:
 - `count_only=1` parses the file and logs the counts (ACT, cancelled at or after the cutoff, cancelled total,
   individuals, S2) with no database connection and nothing sent. Use it to size the cancelled volume.
 - Each database call's duration is logged; the run ends with p50 and max.
+- Manual resume: every `paused:`, `stalled:` and error note ends with the values a continuation needs, for example
+  `(resume with skip=1200000 cutoff=2026-09-14 chain_date=2026-10-28 nonact_count=120 max_nonact=500000 changed_same=40)`.
+  Run the workflow with those as inputs (`skip`, `cutoff`, `chain_date`, `nonact_count`, `max_nonact`,
+  `changed_same`) and `source_id` of the file being read. A continuation without `cutoff`, `chain_date` or
+  `nonact_count` fails, and negative `skip`, `max_nonact`, `nonact_count` or `changed_same` are rejected.
 
 Merge and rollback: merge only when no ABN run is active (`gh run list --workflow abn-bulk.yml` shows nothing
 in progress, queued, waiting or pending, and the latest ABN run finished more than 30 minutes ago), and apply

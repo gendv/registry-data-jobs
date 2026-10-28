@@ -174,7 +174,7 @@ class ContinuationTest(Base):
             common._watchdog()
         self.assertEqual(post.call_args.kwargs["json"]["inputs"]["cutoff"], "2026-09-14")
         self.assertEqual(post.call_args.kwargs["json"]["inputs"]["skip"], "10")
-        self.assertEqual(conn.calls[-1][1][2], "stalled: continue from skip=10 cutoff=2026-09-14")
+        self.assertEqual(conn.calls[-1][1][2], "stalled: continue from skip=10 cutoff=2026-09-14 changed_same=0")
         self.assertEqual(exits, [3])
 
 
@@ -301,6 +301,107 @@ class CountOnlyTest(Base):
             with self.assertRaises(common.GuardError) as cm:
                 abn_bulk.main()
         self.assertIn("without cutoff", cm.exception.note)
+
+
+CHAIN = {"cutoff": "2026-09-14", "chain_date": "2026-10-10", "nonact_count": 4, "max_nonact": 500000}
+
+
+class ResumeAndErrorTest(Base):
+    def test_resume_hint_lists_every_chain_value(self):
+        common.STATE.update(chain=dict(CHAIN), changed_same=40)
+        self.assertEqual(common._resume_hint(),
+                         " cutoff=2026-09-14 chain_date=2026-10-10 nonact_count=4 max_nonact=500000 changed_same=40")
+        common.STATE["chain"] = {}
+        self.assertEqual(common._resume_hint(), "")
+
+    def test_paused_note_carries_cutoff_and_the_other_chain_values(self):
+        common.STATE.update(changed=True, chain=dict(CHAIN), changed_same=7)
+        conn = FakeConn({"changed": 0})
+        with mock.patch.object(common, "_connect", lambda: conn), mock.patch.object(common.threading, "Thread"), \
+                mock.patch.object(common, "MAX_MINUTES", -1):
+            sent, finished = common.ingest("src", iter([("k", None, {"a": 1})]), skip=0)
+        self.assertFalse(finished)
+        note = conn.calls[-1][1][2]
+        self.assertEqual(note, "paused: continue from skip=0 cutoff=2026-09-14 chain_date=2026-10-10 "
+                               "nonact_count=4 max_nonact=500000 changed_same=7")
+
+    def test_guard_error_before_any_run_exists_starts_a_run_and_writes_the_note_as_is(self):
+        common.STATE.update(changed=True, run=None, chain=dict(CHAIN))
+        conn = FakeConn("run-9")
+        with mock.patch.object(common, "_connect", lambda: conn):
+            with self.assertRaises(common.GuardError):
+                common.guarded("src", lambda: (_ for _ in ()).throw(common.GuardError("nonact_guard: too many")))
+        self.assertIn("bulk_run_start", conn.calls[0][0])
+        self.assertEqual(conn.calls[1][1], ("run-9", "nonact_guard: too many"))
+
+    def test_count_only_error_reraises_without_connecting(self):
+        with mock.patch.dict(os.environ, {"COUNT_ONLY": "1"}), \
+                mock.patch.object(common, "_connect") as connect:
+            with self.assertRaises(ValueError):
+                common.guarded("src", lambda: (_ for _ in ()).throw(ValueError("bad file")))
+        connect.assert_not_called()
+
+
+class MainChainTest(Base):
+    """abn_bulk.main() on continuations, with the file and the job runner replaced."""
+
+    def run_main(self, env, skip, source_id_old="", ids="2026-10-04T10:00:00"):
+        path = make_zip(self.tmp.name, ROWS)
+        seen = {}
+
+        def fake_run_job(source, records_fn, **kw):
+            records_fn()
+            seen["kw"] = kw
+
+        def fake_records(paths, cutoff, max_nonact, today, stats=None, expected_nonact=None):
+            seen.update(paths=paths, cutoff=cutoff, today=today, expected=expected_nonact, max_nonact=max_nonact)
+            return iter(())
+
+        base = {"CUTOFF": "", "CHAIN_DATE": "", "NONACT_COUNT": "", "CHANGED_SAME": "", "MAX_NONACT": "", "COUNT_ONLY": ""}
+        base.update(env)
+        with mock.patch.dict(os.environ, base), mock.patch.object(common, "SKIP", skip), \
+                mock.patch.object(common, "SOURCE_ID", source_id_old), \
+                mock.patch.object(abn_bulk, "zip_resources", lambda: [{"url": "u", "last_modified": ids}]), \
+                mock.patch.object(abn_bulk, "download", lambda url, p: __import__("shutil").copy(path, p)), \
+                mock.patch.object(abn_bulk, "run_job", fake_run_job), mock.patch.object(abn_bulk, "records", fake_records), \
+                mock.patch.object(abn_bulk, "resolve_cutoff", side_effect=AssertionError("cutoff recomputed")), \
+                mock.patch.object(common, "_connect", side_effect=AssertionError("database opened")):
+            abn_bulk.main()
+        return seen
+
+    def test_continuation_uses_chain_date_as_today_and_keeps_the_chain_values(self):
+        env = {"CUTOFF": "2026-09-14", "CHAIN_DATE": "2026-10-10", "NONACT_COUNT": "4", "CHANGED_SAME": "9"}
+        seen = self.run_main(env, 100)
+        self.assertEqual(seen["today"], date(2026, 10, 10))
+        self.assertEqual(seen["cutoff"], "2026-09-14")
+        self.assertEqual(seen["expected"], 4)
+        self.assertEqual(common.STATE["chain"], {"cutoff": "2026-09-14", "max_nonact": 500000, "nonact_count": 4,
+                                                 "chain_date": "2026-10-10"})
+        self.assertEqual(common.STATE["changed_same"], 9)
+
+    def test_continuation_without_nonact_count_fails(self):
+        env = {"CUTOFF": "2026-09-14", "CHAIN_DATE": "2026-10-10"}
+        with self.assertRaises(common.GuardError) as cm:
+            self.run_main(env, 100)
+        self.assertIn("without nonact_count", cm.exception.note)
+
+    def test_negative_chain_inputs_are_rejected(self):
+        for name in ("CHANGED_SAME", "MAX_NONACT", "NONACT_COUNT"):
+            env = {"CUTOFF": "2026-09-14", "CHAIN_DATE": "2026-10-10", "NONACT_COUNT": "4", name: "-1"}
+            with self.assertRaises(common.GuardError, msg=name) as cm:
+                self.run_main(env, 100)
+            self.assertIn("negative", cm.exception.note)
+
+    def test_restart_on_a_changed_file_recounts_and_keeps_the_cutoff(self):
+        # SKIP > 0 but the chain's file id differs from the new file: effective skip 0, so the new file is counted again
+        env = {"CUTOFF": "2026-09-14", "CHAIN_DATE": "2026-10-10", "NONACT_COUNT": "999", "CHANGED_SAME": "3"}
+        seen = self.run_main(env, 100, source_id_old="old-file-id")
+        self.assertEqual(seen["cutoff"], "2026-09-14")            # kept, not recomputed
+        self.assertEqual(seen["today"], date(2026, 10, 10))
+        self.assertEqual(seen["expected"], 3)                     # recounted from the new file (rows 2, 5, 7), not 999
+        self.assertEqual(common.STATE["chain"]["nonact_count"], 3)
+        self.assertEqual(seen["kw"]["source_id"], "2026-10-04T10:00:00")
+        self.assertNotIn("/tmp/abn_0.zip", seen["paths"])
 
 
 if __name__ == "__main__":
