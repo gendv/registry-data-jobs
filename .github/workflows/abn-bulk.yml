@@ -14,6 +14,24 @@ on:
       source_id:
         description: "File the chain started on (set automatically when a long run continues)"
         default: ""
+      cutoff:
+        description: "Cancelled ABNs dated on or after this day are sent (YYYY-MM-DD, or 'all' as a manual override). Empty = date of the last complete run minus 14 days, else 2026-09-14. Set automatically when a long run continues"
+        default: ""
+      max_nonact:
+        description: "Stop before sending if more cancelled records than this pass the cutoff (default 500000)"
+        default: ""
+      nonact_count:
+        description: "Cancelled records counted by the first run of the chain (set automatically)"
+        default: ""
+      chain_date:
+        description: "Day the chain started (set automatically)"
+        default: ""
+      changed_same:
+        description: "Equal-date updates so far in this chain (set automatically)"
+        default: ""
+      count_only:
+        description: "1 = only parse the file and log counts; no database connection, nothing is sent"
+        default: ""
 
 permissions:
   contents: read
@@ -41,6 +59,12 @@ jobs:
           RECORD_LIMIT: ${{ github.event.inputs.record_limit || '0' }}
           SKIP: ${{ github.event.inputs.skip || '0' }}
           SOURCE_ID: ${{ github.event.inputs.source_id || '' }}
+          CUTOFF: ${{ github.event.inputs.cutoff || '' }}
+          MAX_NONACT: ${{ github.event.inputs.max_nonact || '' }}
+          NONACT_COUNT: ${{ github.event.inputs.nonact_count || '' }}
+          CHAIN_DATE: ${{ github.event.inputs.chain_date || '' }}
+          CHANGED_SAME: ${{ github.event.inputs.changed_same || '' }}
+          COUNT_ONLY: ${{ github.event.inputs.count_only || '' }}
           GITHUB_TOKEN: ${{ github.token }}
 
         run: python abn_bulk.py

@@ -6,6 +6,7 @@ prospecting.bulk_ingest, which only accepts the bulk-job sources.
 import json
 import os
 import sys
+import statistics
 import threading
 import time
 from datetime import date
@@ -28,7 +29,21 @@ STATEMENT_TIMEOUT_S = int(os.environ.get("STATEMENT_TIMEOUT_S", "120"))
 # If the main loop has not handed over this long after MAX_MINUTES (stuck in a call or the iterator), the watchdog does it.
 WATCHDOG_GRACE_MIN = int(os.environ.get("WATCHDOG_GRACE_MIN", "15"))
 # Shared with guarded() so an error is written to the run that failed, with the resume point.
-STATE = {"run": None, "sent": 0, "skip": SKIP, "source_id": "", "handed_over": False, "insert_only": False}
+# Same-rlud ceiling for the ABN "changed" mode (spec 3.1): updates of records whose recordLastUpdatedDate
+# is equal to the stored one, counted across the whole chain. The function enforces its own hard maximum.
+MAX_CHANGED_SAME = int(os.environ.get("MAX_CHANGED_SAME", "50000"))
+# "chain" carries what a continuation needs (cutoff, max_nonact, nonact_count, chain_date); empty for other jobs.
+STATE = {"run": None, "sent": 0, "skip": SKIP, "source_id": "", "handed_over": False, "insert_only": False,
+         "changed": False, "chain": {}, "changed_same": 0, "changed_newer": 0, "changed_total": 0,
+         "new_total": 0, "durations": []}
+
+
+class GuardError(Exception):
+    """A guard stopped the job. `note` is written to the run as is, so feed_health shows it."""
+
+    def __init__(self, note):
+        super().__init__(note)
+        self.note = note
 
 
 def valid_day(v):
@@ -63,31 +78,87 @@ def _connect():
 
 
 def _ingest_sql():
-    """The database call for this run. Insert-only mode never touches rows that already exist
-    (prospecting.bulk_ingest_new_only: on conflict do nothing); the default updates them (bulk_ingest)."""
+    """The database call for this run. Modes:
+    changed     prospecting.bulk_ingest_changed: inserts new keys, updates an existing row only when the
+                record changed (recordLastUpdatedDate newer, or same date with a different item);
+    insert_only prospecting.bulk_ingest_new_only: on conflict do nothing;
+    default     prospecting.bulk_ingest: upsert of every row."""
+    if STATE["changed"]:
+        return "select prospecting.bulk_ingest_changed(%s, %s::jsonb, %s, %s, %s)"
     fn = "bulk_ingest_new_only" if STATE["insert_only"] else "bulk_ingest"
     return f"select prospecting.{fn}(%s, %s::jsonb, %s)"
+
+
+def _resume_hint():
+    """Every chain value a manual continuation needs, e.g. ' cutoff=2026-09-14 chain_date=2026-10-28
+    nonact_count=120 max_nonact=500000 changed_same=40'. Empty for jobs without a chain."""
+    chain = STATE["chain"]
+    if not chain:
+        return ""
+    parts = [f"{k}={chain[k]}" for k in ("cutoff", "chain_date", "nonact_count", "max_nonact")
+             if chain.get(k) not in (None, "")]
+    parts.append(f"changed_same={STATE['changed_same']}")
+    return " " + " ".join(parts)
 
 
 def _ingest_call(conn, run, payload, note):
     """One bulk_ingest call with a per-call statement timeout. The timeout is set with
     set_config(..., is_local) inside a transaction rather than as a startup option, because the
     Supabase pooler in transaction mode does not pass startup options through."""
+    t = time.time()
     with conn.transaction():
         conn.execute("select set_config('statement_timeout', %s, true)", (f"{STATEMENT_TIMEOUT_S}s",))
-        conn.execute(_ingest_sql(), (run, payload, note))
+        if STATE["changed"]:
+            params = (run, payload, note, STATE["changed_same"], MAX_CHANGED_SAME)
+        else:
+            params = (run, payload, note)
+        cur = conn.execute(_ingest_sql(), params)
+        res = cur.fetchone()[0] if cur is not None else None
+    if STATE["changed"]:
+        took = time.time() - t
+        STATE["durations"].append(took)
+        log(f"call {took:.2f}s")
+        _count_result(res)
+    return res
+
+
+def _count_result(res):
+    """Add one call's counters to the chain totals; stop the job if the same-rlud guard tripped."""
+    if not isinstance(res, dict):
+        return
+    STATE["changed_same"] += int(res.get("changed_same") or 0)
+    STATE["changed_newer"] += int(res.get("changed_newer") or 0)
+    STATE["changed_total"] += int(res.get("changed") or 0)
+    STATE["new_total"] += int(res.get("new_jobs") or 0)
+    if res.get("guard"):
+        raise GuardError(f"same_rlud_guard: equal-date updates passed {MAX_CHANGED_SAME:,} in this chain "
+                         f"(now {STATE['changed_same']:,}); the equal-date rule was switched off for the rest of the batch. "
+                         "Check the parser or the register schema before raising MAX_CHANGED_SAME")
+
+
+def _report_durations():
+    d = STATE["durations"]
+    if d:
+        log(f"call time p50 {statistics.median(d):.2f}s, max {max(d):.2f}s over {len(d):,} calls")
 
 
 def _dispatch_continuation(skip, source_id):
-    """Start a new run of this workflow that resumes at record `skip`."""
+    """Start a new run of this workflow that resumes at record `skip`. A job with a chain (ABN changed mode)
+    also passes on its cutoff, limits and counters; this is the one place both the normal hand-over and the
+    watchdog use."""
     import requests
+    inputs = {"skip": str(skip), "record_limit": "0", "source_id": source_id or ""}
+    chain = STATE["chain"]
+    if chain:
+        inputs.update({k: str(v) for k, v in chain.items()})
+        inputs["changed_same"] = str(STATE["changed_same"])
     repo = os.environ["GITHUB_REPOSITORY"]
     wf = os.environ["GITHUB_WORKFLOW_REF"].split("@")[0].split("/")[-1]
     ref = os.environ.get("GITHUB_REF_NAME", "main")
     r = requests.post(
         f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/dispatches",
         headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}", "Accept": "application/vnd.github+json"},
-        json={"ref": ref, "inputs": {"skip": str(skip), "record_limit": "0", "source_id": source_id or ""}},
+        json={"ref": ref, "inputs": inputs},
         timeout=30,
     )
     r.raise_for_status()
@@ -111,7 +182,7 @@ def _watchdog():
     try:
         if STATE["run"]:
             conn = _connect()
-            _ingest_call(conn, STATE["run"], "[]", f"stalled: continue from skip={resume}")
+            _ingest_call(conn, STATE["run"], "[]", f"stalled: continue from skip={resume}{_resume_hint()}")
             conn.close()
     except Exception as e:
         log(f"watchdog: could not record the stall: {e}")
@@ -133,7 +204,8 @@ def ingest(source, records, note=None, skip=None, insert_only=None):
     conn = _connect()
     run = conn.execute("select prospecting.bulk_run_start(%s)", (source,)).fetchone()[0]
     STATE.update(run=run, sent=0, skip=skip)
-    log(f"run {run} started for {source} ({'insert-only' if STATE['insert_only'] else 'upsert'})")
+    mode = "changed-only" if STATE["changed"] else "insert-only" if STATE["insert_only"] else "upsert"
+    log(f"run {run} started for {source} ({mode})")
     threading.Thread(target=_watchdog, daemon=True).start()
     batch, sent, t0 = [], 0, time.time()
 
@@ -204,24 +276,57 @@ def ingest(source, records, note=None, skip=None, insert_only=None):
     flush()
     log(f"{'done' if finished else 'paused'}: {sent:,} records for {source} in {time.time() - t0:.0f}s (skipped {skipped:,})")
     if not finished:
-        _ingest_call(conn, run, "[]", f"paused: continue from skip={skip + sent}")
+        _ingest_call(conn, run, "[]", f"paused: continue from skip={skip + sent}{_resume_hint()}")
     conn.close()
     STATE["handed_over"] = True
+    if STATE["changed"]:
+        log(f"changed {STATE['changed_total']:,} (newer {STATE['changed_newer']:,}, same date {STATE['changed_same']:,} "
+            f"in this chain), new {STATE['new_total']:,}")
+        _report_durations()
     return sent, finished
 
 
-def run_job(source, records_fn, source_id="", insert_only=False):
+def effective_skip(source_id):
+    """Where this run starts. A continuation that finds a different file than its chain started on
+    starts from 0 (the caller keeps the chain's cutoff)."""
+    if SKIP and SOURCE_ID and source_id and SOURCE_ID != source_id:
+        return 0
+    return SKIP
+
+
+def _write_note(note):
+    """Put a note on the current run without sending records (the original function, which always exists)."""
+    conn = _connect()
+    try:
+        conn.execute("select prospecting.bulk_ingest(%s, '[]'::jsonb, %s)", (STATE["run"], note))
+    finally:
+        conn.close()
+
+
+def run_job(source, records_fn, source_id="", insert_only=False, changed=False, on_complete=None):
     """Ingest, then start a continuation run if time ran out.
     records_fn() returns the record iterator. source_id identifies the downloaded file;
     if a continuation finds a different file than the chain started on, it loads the
-    new file from the start (upserts make that safe) instead of skipping by a stale count."""
-    skip = SKIP
-    if SKIP and SOURCE_ID and source_id and SOURCE_ID != source_id:
+    new file from the start (upserts make that safe) instead of skipping by a stale count.
+    changed=True uses the changed-only database call. When the whole file has been read (no record limit),
+    on_complete() may return a completion note, which is written to the run; a record-limited run
+    in changed mode writes 'test: record_limit=N' instead."""
+    skip = effective_skip(source_id)
+    if skip != SKIP:
         log(f"source changed since this chain started ({SOURCE_ID} -> {source_id}); loading the new file from the start")
-        skip = 0
     STATE["source_id"] = source_id or ""
     STATE["insert_only"] = insert_only
+    STATE["changed"] = changed
     sent, finished = ingest(source, records_fn(), skip=skip)
+    if finished:
+        note = None
+        if changed and LIMIT:
+            note = f"test: record_limit={LIMIT}"
+        elif changed and on_complete:
+            note = on_complete()
+        if note:
+            _write_note(note)
+            log(note)
     if finished or LIMIT:
         return
     _dispatch_continuation(skip + sent, source_id)
@@ -253,10 +358,15 @@ def guarded(source, fn):
     except BaseException as e:
         if isinstance(e, KeyboardInterrupt):
             raise
-        msg = "job error: " + "".join(traceback.format_exception_only(type(e), e)).strip()[:350]
+        if isinstance(e, GuardError):
+            msg = e.note[:350]
+        else:
+            msg = "job error: " + "".join(traceback.format_exception_only(type(e), e)).strip()[:350]
         if STATE["run"]:
-            msg += f" (resume with skip={STATE['skip'] + STATE['sent']})"
+            msg += f" (resume with skip={STATE['skip'] + STATE['sent']}{_resume_hint()})"
         log(msg)
+        if os.environ.get("COUNT_ONLY", "").strip() in ("1", "true"):
+            raise  # count-only never opens a database connection, not even to record an error
         try:
             conn = _connect()
             run = STATE["run"] or conn.execute("select prospecting.bulk_run_start(%s)", (source,)).fetchone()[0]
